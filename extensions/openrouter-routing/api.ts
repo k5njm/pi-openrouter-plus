@@ -10,6 +10,7 @@ import {
   type OpenRouterCreditsInfo,
   type EndpointCacheEntry,
 } from "./types.js";
+import { createGunzip, createInflate } from "zlib";
 
 let cachedModels: OpenRouterModel[] | null = null;
 let cacheTimestamp = 0;
@@ -25,6 +26,52 @@ function makeHeaders(apiKey?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
   return headers;
+}
+
+async function decompressResponse(res: Response): Promise<string> {
+  const contentEncoding = res.headers.get("content-encoding");
+  const bodyBuffer = Buffer.from(await res.arrayBuffer());
+
+  // If empty or no encoding, return as-is
+  if (bodyBuffer.length === 0) {
+    return "";
+  }
+
+  // Check magic bytes
+  const byte0 = bodyBuffer[0];
+  const byte1 = bodyBuffer[1];
+  const isGzip = byte0 === 0x1f && byte1 === 0x8b;
+  const isDeflate = !isGzip && byte0 === 0x78 && (byte1 === 0x9c || byte1 === 0x01 || byte1 === 0xda);
+
+  // If it doesn't look compressed, return as-is (might be raw JSON or already decompressed by fetch)
+  if (!contentEncoding && !isGzip && !isDeflate) {
+    return bodyBuffer.toString("utf8");
+  }
+
+  // Try decompression
+  if (isGzip || (contentEncoding && contentEncoding.includes("gzip"))) {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const gunzip = createGunzip();
+      gunzip.on("data", (chunk) => chunks.push(chunk));
+      gunzip.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      gunzip.on("error", reject);
+      gunzip.write(bodyBuffer);
+      gunzip.end();
+    });
+  } else if (isDeflate || (contentEncoding && contentEncoding.includes("deflate"))) {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const inflate = createInflate();
+      inflate.on("data", (chunk) => chunks.push(chunk));
+      inflate.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      inflate.on("error", reject);
+      inflate.write(bodyBuffer);
+      inflate.end();
+    });
+  }
+
+  return bodyBuffer.toString("utf8");
 }
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
@@ -86,7 +133,18 @@ export async function fetchModels(apiKey?: string, force = false): Promise<OpenR
   });
   if (!res.ok) throw formatFetchError(res, "OpenRouter models API");
 
-  const json = (await res.json()) as { data?: OpenRouterModel[] };
+  const bodyText = await decompressResponse(res);
+  if (!bodyText || bodyText.trim() === "") {
+    throw new Error("OpenRouter models API returned empty response - check network/proxy");
+  }
+
+  let json: { data?: OpenRouterModel[] };
+  try {
+    json = JSON.parse(bodyText);
+  } catch {
+    throw new Error(`OpenRouter models API returned invalid JSON (${bodyText.length} bytes received). Response may be HTML or error page - check network/proxy.`);
+  }
+
   cachedModels = json.data || [];
   cacheTimestamp = now;
   return cachedModels;
@@ -121,7 +179,18 @@ export async function fetchModelEndpoints(
   }
   if (!res.ok) throw formatFetchError(res, "OpenRouter endpoints API");
 
-  const json = (await res.json()) as OpenRouterEndpointsResponse;
+  const bodyText = await decompressResponse(res);
+  if (!bodyText || bodyText.trim() === "") {
+    throw new Error("OpenRouter endpoints API returned empty response");
+  }
+
+  let json: OpenRouterEndpointsResponse;
+  try {
+    json = JSON.parse(bodyText);
+  } catch {
+    throw new Error(`OpenRouter endpoints API returned invalid JSON (${bodyText.length} bytes received)`);
+  }
+
   const endpoints = json.data?.endpoints || [];
   endpointCache.set(modelId, { timestamp: now, endpoints });
   return endpoints;
@@ -133,8 +202,17 @@ export async function fetchKeyInfo(apiKey: string): Promise<OpenRouterKeyInfo> {
   });
   if (!res.ok) throw formatFetchError(res, "OpenRouter key API");
 
-  const json = (await res.json()) as { data?: OpenRouterKeyInfo };
-  return json.data || {};
+  const bodyText = await decompressResponse(res);
+  if (!bodyText || bodyText.trim() === "") {
+    return {};
+  }
+
+  try {
+    const json = JSON.parse(bodyText) as { data?: OpenRouterKeyInfo };
+    return json.data || {};
+  } catch {
+    return {};
+  }
 }
 
 export async function fetchCredits(apiKey: string): Promise<OpenRouterCreditsInfo | null> {
