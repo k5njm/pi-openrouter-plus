@@ -29,27 +29,19 @@ function makeHeaders(apiKey?: string): Record<string, string> {
 }
 
 async function decompressResponse(res: Response): Promise<string> {
-  const contentEncoding = res.headers.get("content-encoding");
   const bodyBuffer = Buffer.from(await res.arrayBuffer());
 
-  // If empty or no encoding, return as-is
-  if (bodyBuffer.length === 0) {
-    return "";
-  }
+  if (bodyBuffer.length === 0) return "";
 
-  // Check magic bytes
+  // Decide based on magic bytes ONLY — native fetch auto-decompresses gzip
+  // but leaves the Content-Encoding header, so trusting that header causes
+  // "incorrect header check" when we gunzip already-decompressed JSON.
   const byte0 = bodyBuffer[0];
   const byte1 = bodyBuffer[1];
   const isGzip = byte0 === 0x1f && byte1 === 0x8b;
-  const isDeflate = !isGzip && byte0 === 0x78 && (byte1 === 0x9c || byte1 === 0x01 || byte1 === 0xda);
+  const isDeflate = byte0 === 0x78 && (byte1 === 0x9c || byte1 === 0x01 || byte1 === 0xda);
 
-  // If it doesn't look compressed, return as-is (might be raw JSON or already decompressed by fetch)
-  if (!contentEncoding && !isGzip && !isDeflate) {
-    return bodyBuffer.toString("utf8");
-  }
-
-  // Try decompression
-  if (isGzip || (contentEncoding && contentEncoding.includes("gzip"))) {
+  if (isGzip) {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       const gunzip = createGunzip();
@@ -59,7 +51,9 @@ async function decompressResponse(res: Response): Promise<string> {
       gunzip.write(bodyBuffer);
       gunzip.end();
     });
-  } else if (isDeflate || (contentEncoding && contentEncoding.includes("deflate"))) {
+  }
+
+  if (isDeflate) {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       const inflate = createInflate();
@@ -71,6 +65,7 @@ async function decompressResponse(res: Response): Promise<string> {
     });
   }
 
+  // Already decompressed (by fetch) or was never compressed
   return bodyBuffer.toString("utf8");
 }
 
@@ -221,7 +216,9 @@ export async function fetchCredits(apiKey: string): Promise<OpenRouterCreditsInf
       headers: makeHeaders(apiKey),
     });
     if (!res.ok) return null; // requires management key, may fail with regular key
-    const json = (await res.json()) as { data?: OpenRouterCreditsInfo };
+    const bodyText = await decompressResponse(res);
+    if (!bodyText || bodyText.trim() === "") return null;
+    const json = JSON.parse(bodyText) as { data?: OpenRouterCreditsInfo };
     return json.data || null;
   } catch {
     return null;
